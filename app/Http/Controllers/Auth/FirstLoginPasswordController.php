@@ -56,7 +56,7 @@ class FirstLoginPasswordController extends Controller
             'password' => [
                 'required',
                 'confirmed',
-                Password::min(12),
+                Password::min(6),
             ],
         ]);
 
