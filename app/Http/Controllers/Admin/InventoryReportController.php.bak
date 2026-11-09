@@ -1,0 +1,588 @@
+<?php
+
+namespace App\Http\Controllers\Admin;
+
+use App\Http\Controllers\Controller;
+use App\Models\Accessory;
+use App\Models\Branch;
+use App\Models\LpgStorageUnit;
+use App\Services\LpgStockBalanceService;
+use Illuminate\Http\Request;
+use Illuminate\View\View;
+
+class InventoryReportController extends Controller
+{
+    /**
+     * Display current LPG and accessory inventory.
+     */
+    public function index(
+        Request $request,
+        LpgStockBalanceService $stockBalanceService
+    ): View {
+        $user = $request->user();
+
+        abort_unless(
+            $user && $user->hasPermission('reports.view'),
+            403
+        );
+
+        $filters = $request->validate([
+            'branch_id' => [
+                'nullable',
+                'integer',
+                'exists:branches,id',
+            ],
+        ]);
+
+        $branchId = $filters['branch_id'] ?? null;
+
+        /*
+         * Enforce branch access restrictions.
+         */
+        $allowedBranchIds = null;
+
+        if (!$user->hasRole('owner')) {
+            $allowedBranchIds = $user->branches()
+                ->pluck('branches.id')
+                ->all();
+
+            if ($branchId !== null) {
+                abort_unless(
+                    in_array(
+                        (int) $branchId,
+                        array_map('intval', $allowedBranchIds),
+                        true
+                    ),
+                    403
+                );
+            }
+        }
+
+        /*
+         * Branch filter options.
+         */
+        $branches = Branch::query()
+            ->when(
+                $allowedBranchIds !== null,
+                fn ($query) => $query->whereIn(
+                    'id',
+                    $allowedBranchIds
+                )
+            )
+            ->orderBy('branch_name')
+            ->get();
+
+        /*
+         * LPG storage units.
+         */
+        $storageUnits = LpgStorageUnit::query()
+            ->with('branch')
+            ->when(
+                $allowedBranchIds !== null,
+                fn ($query) => $query->whereIn(
+                    'branch_id',
+                    $allowedBranchIds
+                )
+            )
+            ->when(
+                $branchId !== null,
+                fn ($query) => $query->where(
+                    'branch_id',
+                    $branchId
+                )
+            )
+            ->orderBy('storage_name')
+            ->get();
+
+        $lpgStock = $storageUnits->map(
+            function ($unit) use ($stockBalanceService) {
+                $balance = $stockBalanceService
+                    ->getBalance($unit->id);
+
+                $capacity = (float) $unit->capacity_kg;
+
+                return [
+                    'storage_unit_id' => $unit->id,
+                    'storage_code' => $unit->storage_code,
+                    'storage_name' => $unit->storage_name,
+                    'storage_type' => $unit->storage_type,
+                    'branch' => $unit->branch?->branch_name,
+                    'capacity_kg' => $unit->capacity_kg,
+                    'balance_kg' => $balance,
+                    'utilization' => $capacity > 0
+                        ? round(
+                            ((float) $balance / $capacity) * 100,
+                            2
+                        )
+                        : 0,
+                    'status' => $unit->status,
+                ];
+            }
+        );
+
+        /*
+         * Accessory inventory.
+         */
+        $accessories = Accessory::query()
+            ->with('branch')
+            ->when(
+                $allowedBranchIds !== null,
+                fn ($query) => $query->whereIn(
+                    'branch_id',
+                    $allowedBranchIds
+                )
+            )
+            ->when(
+                $branchId !== null,
+                fn ($query) => $query->where(
+                    'branch_id',
+                    $branchId
+                )
+            )
+            ->orderBy('name')
+            ->get();
+
+        $accessoryStock = $accessories->map(
+            function ($accessory) {
+                return [
+                    'accessory_number' =>
+                        $accessory->accessory_number,
+                    'name' => $accessory->name,
+                    'category' => $accessory->category,
+                    'branch' => $accessory->branch?->branch_name,
+                    'unit' => $accessory->unit,
+                    'quantity' => $accessory->quantity,
+                    'reorder_level' => $accessory->reorder_level,
+                    'unit_buying_price' =>
+                        $accessory->unit_buying_price,
+                    'unit_selling_price' =>
+                        $accessory->unit_selling_price,
+                    'stock_value' => $accessory->stock_value,
+                    'status' => $accessory->status,
+                    'low_stock' =>
+                        (float) $accessory->quantity <=
+                        (float) $accessory->reorder_level,
+                ];
+            }
+        );
+
+        /*
+         * Current inventory summaries.
+         *
+         * LPG kilograms and accessory units are
+         * deliberately not combined.
+         */
+        $summary = [
+            'storage_units' => $lpgStock->count(),
+
+            'lpg_quantity_kg' => $lpgStock->sum(
+                fn ($item) => (float) $item['balance_kg']
+            ),
+
+            'lpg_capacity_kg' => $lpgStock->sum(
+                fn ($item) => (float) $item['capacity_kg']
+            ),
+
+            'accessory_items' => $accessoryStock->count(),
+
+            'accessory_stock_value' => $accessoryStock->sum(
+                fn ($item) => (float) $item['stock_value']
+            ),
+
+            'low_stock_items' => $accessoryStock->filter(
+                fn ($item) => $item['low_stock']
+            )->count(),
+        ];
+
+        return view('admin.reports.inventory.index', [
+            'filters' => $filters,
+            'branches' => $branches,
+            'lpgStock' => $lpgStock,
+            'accessoryStock' => $accessoryStock,
+            'summary' => $summary,
+        ]);
+    }
+
+    /**
+     * Export current inventory position as CSV.
+     */
+    public function exportCsv(Request $request)
+    {
+        $user = $request->user();
+
+        abort_unless(
+            $user && $user->hasPermission('reports.view'),
+            403
+        );
+
+        $filters = $request->validate([
+            'branch_id' => [
+                'nullable',
+                'integer',
+                'exists:branches,id',
+            ],
+        ]);
+
+        $branchId = $filters['branch_id'] ?? null;
+
+        $allowedBranchIds = null;
+
+        if (!$user->hasRole('owner')) {
+            $allowedBranchIds = $user->branches()
+                ->pluck('branches.id')
+                ->all();
+
+            if ($branchId !== null) {
+                abort_unless(
+                    in_array(
+                        (int) $branchId,
+                        array_map('intval', $allowedBranchIds),
+                        true
+                    ),
+                    403
+                );
+            }
+        }
+
+        $storageUnits = \App\Models\LpgStorageUnit::query()
+            ->with('branch')
+            ->when(
+                $allowedBranchIds !== null,
+                fn ($query) => $query->whereIn(
+                    'branch_id',
+                    $allowedBranchIds
+                )
+            )
+            ->when(
+                $branchId !== null,
+                fn ($query) => $query->where(
+                    'branch_id',
+                    $branchId
+                )
+            )
+            ->orderBy('id')
+            ->get();
+
+        $accessories = \App\Models\Accessory::query()
+            ->with('branch')
+            ->when(
+                $allowedBranchIds !== null,
+                fn ($query) => $query->whereIn(
+                    'branch_id',
+                    $allowedBranchIds
+                )
+            )
+            ->when(
+                $branchId !== null,
+                fn ($query) => $query->where(
+                    'branch_id',
+                    $branchId
+                )
+            )
+            ->orderBy('id')
+            ->get();
+
+        $stockService = app(
+            \App\Services\LpgStockBalanceService::class
+        );
+
+        $filename = 'inventory-report-'
+            . now()->format('Ymd-His')
+            . '.csv';
+
+        return response()->streamDownload(
+            function () use (
+                $storageUnits,
+                $accessories,
+                $stockService
+            ) {
+                $handle = fopen('php://output', 'w');
+
+                // UTF-8 BOM for Excel compatibility.
+                fwrite($handle, "\xEF\xBB\xBF");
+
+                fputcsv($handle, [
+                    'INVENTORY REPORT - CURRENT STOCK POSITION',
+                ]);
+
+                fputcsv($handle, [
+                    'Generated At',
+                    now()->format('Y-m-d H:i:s'),
+                ]);
+
+                fputcsv($handle, []);
+
+                fputcsv($handle, ['LPG STOCK POSITION']);
+
+                fputcsv($handle, [
+                    'Storage Code',
+                    'Storage Unit',
+                    'Type',
+                    'Branch',
+                    'Capacity (kg)',
+                    'Available (kg)',
+                    'Utilization (%)',
+                    'Status',
+                ]);
+
+                foreach ($storageUnits as $unit) {
+                    $balance = $stockService->getBalance(
+                        $unit->id
+                    );
+
+                    $capacity = (float) $unit->capacity_kg;
+
+                    $utilization = $capacity > 0
+                        ? round(
+                            ((float) $balance / $capacity) * 100,
+                            2
+                        )
+                        : 0;
+
+                    fputcsv($handle, [
+                        $unit->storage_code,
+                        $unit->storage_name,
+                        $unit->storage_type,
+                        $unit->branch?->branch_name,
+                        $unit->capacity_kg,
+                        $balance,
+                        $utilization,
+                        $unit->status,
+                    ]);
+                }
+
+                fputcsv($handle, []);
+                fputcsv($handle, ['ACCESSORY INVENTORY']);
+
+                fputcsv($handle, [
+                    'Accessory Number',
+                    'Item Name',
+                    'Category',
+                    'Branch',
+                    'Unit',
+                    'Quantity',
+                    'Reorder Level',
+                    'Unit Buying Price (NGN)',
+                    'Stock Value (NGN)',
+                    'Status',
+                ]);
+
+                foreach ($accessories as $accessory) {
+                    fputcsv($handle, [
+                        $accessory->accessory_number,
+                        $accessory->name,
+                        $accessory->category,
+                        $accessory->branch?->branch_name,
+                        $accessory->unit,
+                        $accessory->quantity,
+                        $accessory->reorder_level,
+                        $accessory->unit_buying_price,
+                        $accessory->stock_value,
+                        $accessory->status,
+                    ]);
+                }
+
+                fclose($handle);
+            },
+            $filename,
+            [
+                'Content-Type' =>
+                    'text/csv; charset=UTF-8',
+            ]
+        );
+    }
+
+
+    /**
+     * Export the current inventory position as PDF.
+     */
+    public function exportPdf(
+        Request $request,
+        \App\Services\LpgStockBalanceService $stockBalanceService
+    ) {
+        $user = $request->user();
+
+        abort_unless(
+            $user && $user->hasPermission('reports.view'),
+            403
+        );
+
+        $filters = $request->validate([
+            'branch_id' => [
+                'nullable',
+                'integer',
+                'exists:branches,id',
+            ],
+        ]);
+
+        $branchId = $filters['branch_id'] ?? null;
+
+        /*
+        * Enforce authorized branch access.
+        */
+        $allowedBranchIds = null;
+
+        if (!$user->hasRole('owner')) {
+            $allowedBranchIds = $user->branches()
+                ->pluck('branches.id')
+                ->all();
+
+            if ($branchId !== null) {
+                abort_unless(
+                    in_array(
+                        (int) $branchId,
+                        array_map('intval', $allowedBranchIds),
+                        true
+                    ),
+                    403
+                );
+            }
+        }
+
+        /*
+        * Determine the report branch label.
+        */
+        $branchLabel = 'All Authorized Branches';
+
+        if ($branchId !== null) {
+            $branch = \App\Models\Branch::findOrFail($branchId);
+
+            $branchLabel = $branch->branch_name;
+        }
+
+        /*
+        * LPG stock position.
+        */
+        $storageUnits = \App\Models\LpgStorageUnit::query()
+            ->with('branch')
+            ->when(
+                $allowedBranchIds !== null,
+                fn ($query) => $query->whereIn(
+                    'branch_id',
+                    $allowedBranchIds
+                )
+            )
+            ->when(
+                $branchId !== null,
+                fn ($query) => $query->where(
+                    'branch_id',
+                    $branchId
+                )
+            )
+            ->orderBy('storage_name')
+            ->get();
+
+        $lpgStock = $storageUnits->map(
+            function ($unit) use ($stockBalanceService) {
+                $balance = $stockBalanceService
+                    ->getBalance($unit->id);
+
+                $capacity = (float) $unit->capacity_kg;
+
+                return [
+                    'storage_code' => $unit->storage_code,
+                    'storage_name' => $unit->storage_name,
+                    'storage_type' => $unit->storage_type,
+                    'branch' => $unit->branch?->branch_name,
+                    'capacity_kg' => $unit->capacity_kg,
+                    'balance_kg' => $balance,
+                    'utilization' => $capacity > 0
+                        ? round(
+                            ((float) $balance / $capacity) * 100,
+                            2
+                        )
+                        : 0,
+                    'status' => $unit->status,
+                ];
+            }
+        );
+
+        /*
+        * Current accessory inventory.
+        */
+        $accessories = \App\Models\Accessory::query()
+            ->with('branch')
+            ->when(
+                $allowedBranchIds !== null,
+                fn ($query) => $query->whereIn(
+                    'branch_id',
+                    $allowedBranchIds
+                )
+            )
+            ->when(
+                $branchId !== null,
+                fn ($query) => $query->where(
+                    'branch_id',
+                    $branchId
+                )
+            )
+            ->orderBy('name')
+            ->get();
+
+        $accessoryStock = $accessories->map(
+            function ($accessory) {
+                return [
+                    'accessory_number' =>
+                        $accessory->accessory_number,
+                    'name' => $accessory->name,
+                    'category' => $accessory->category,
+                    'branch' => $accessory->branch?->branch_name,
+                    'unit' => $accessory->unit,
+                    'quantity' => $accessory->quantity,
+                    'reorder_level' => $accessory->reorder_level,
+                    'unit_buying_price' =>
+                        $accessory->unit_buying_price,
+                    'stock_value' => $accessory->stock_value,
+                    'status' => $accessory->status,
+                    'low_stock' =>
+                        (float) $accessory->quantity <=
+                        (float) $accessory->reorder_level,
+                ];
+            }
+        );
+
+        /*
+        * Report summary.
+        */
+        $summary = [
+            'storage_units' => $lpgStock->count(),
+
+            'lpg_quantity_kg' => $lpgStock->sum(
+                fn ($item) => (float) $item['balance_kg']
+            ),
+
+            'lpg_capacity_kg' => $lpgStock->sum(
+                fn ($item) => (float) $item['capacity_kg']
+            ),
+
+            'accessory_items' => $accessoryStock->count(),
+
+            'accessory_stock_value' => $accessoryStock->sum(
+                fn ($item) => (float) $item['stock_value']
+            ),
+
+            'low_stock_items' => $accessoryStock->filter(
+                fn ($item) => $item['low_stock']
+            )->count(),
+        ];
+
+        $pdf = \Barryvdh\DomPDF\Facade\Pdf::loadView(
+            'admin.reports.inventory.pdf',
+            [
+                'branchLabel' => $branchLabel,
+                'generatedAt' => now(),
+                'lpgStock' => $lpgStock,
+                'accessoryStock' => $accessoryStock,
+                'summary' => $summary,
+            ]
+        )->setPaper('a4', 'landscape');
+
+        return $pdf->download(
+            'inventory-report-'
+            . now()->format('Ymd-His')
+            . '.pdf'
+        );
+    }
+
+
+}

@@ -1,0 +1,558 @@
+<?php
+
+namespace App\Http\Controllers\Admin;
+
+use App\Http\Controllers\Controller;
+use App\Models\AccessorySale;
+use App\Models\Branch;
+use App\Models\LpgSale;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\View\View;
+use Barryvdh\DomPDF\Facade\Pdf;
+
+class SalesReportController extends Controller
+{
+    /**
+     * Display the consolidated sales report.
+     */
+    public function index(Request $request): View
+    {
+        $user = $request->user();
+
+        abort_unless(
+            $user && $user->hasPermission('reports.view'),
+            403
+        );
+
+        $filters = $request->validate([
+            'date_from' => ['nullable', 'date_format:Y-m-d'],
+            'date_to' => [
+                'nullable',
+                'date_format:Y-m-d',
+                'after_or_equal:date_from',
+            ],
+            'branch_id' => [
+                'nullable',
+                'integer',
+                'exists:branches,id',
+            ],
+        ]);
+
+        $branchId = $filters['branch_id'] ?? null;
+        $dateFrom = $filters['date_from'] ?? null;
+        $dateTo = $filters['date_to'] ?? null;
+
+        /*
+         * Apply existing branch visibility restrictions.
+         * Owners may report across all branches.
+         * Other users are limited to assigned branches.
+         */
+        $allowedBranchIds = null;
+
+        if (!$user->hasRole('owner')) {
+            $allowedBranchIds = $user->branches()
+                ->pluck('branches.id')
+                ->all();
+
+            if ($branchId !== null) {
+                abort_unless(
+                    in_array((int) $branchId, array_map('intval', $allowedBranchIds), true),
+                    403
+                );
+            }
+        }
+
+        /*
+         * LPG posted sales.
+         */
+        $lpgQuery = LpgSale::query()
+            ->where('status', LpgSale::STATUS_POSTED);
+
+        /*
+         * Accessory posted sales.
+         */
+        $accessoryQuery = AccessorySale::query()
+            ->where('status', AccessorySale::STATUS_POSTED);
+
+        foreach ([$lpgQuery, $accessoryQuery] as $query) {
+            if ($allowedBranchIds !== null) {
+                $query->whereIn('branch_id', $allowedBranchIds);
+            }
+
+            if ($branchId !== null) {
+                $query->where('branch_id', $branchId);
+            }
+
+            if ($dateFrom !== null) {
+                $query->whereDate('sale_date', '>=', $dateFrom);
+            }
+
+            if ($dateTo !== null) {
+                $query->whereDate('sale_date', '<=', $dateTo);
+            }
+        }
+
+        /*
+         * Financial summaries are calculated from
+         * recorded posted-sale values.
+         */
+        $lpgSummary = (clone $lpgQuery)
+            ->selectRaw('COUNT(*) as transactions')
+            ->selectRaw('COALESCE(SUM(quantity_kg), 0) as quantity')
+            ->selectRaw('COALESCE(SUM(total_amount), 0) as revenue')
+            ->selectRaw('COALESCE(SUM(cost_of_goods_sold), 0) as cogs')
+            ->selectRaw('COALESCE(SUM(gross_profit), 0) as gross_profit')
+            ->first();
+
+        $accessorySummary = (clone $accessoryQuery)
+            ->selectRaw('COUNT(*) as transactions')
+            ->selectRaw('COALESCE(SUM(quantity), 0) as quantity')
+            ->selectRaw('COALESCE(SUM(total_amount), 0) as revenue')
+            ->selectRaw('COALESCE(SUM(cost_of_goods_sold), 0) as cogs')
+            ->selectRaw('COALESCE(SUM(gross_profit), 0) as gross_profit')
+            ->first();
+
+        /*
+         * Combine the monetary values only.
+         * LPG kilograms and accessory units remain separate.
+         */
+        $summary = [
+            'transactions' =>
+                (int) $lpgSummary->transactions
+                + (int) $accessorySummary->transactions,
+
+            'revenue' =>
+                (float) $lpgSummary->revenue
+                + (float) $accessorySummary->revenue,
+
+            'cogs' =>
+                (float) $lpgSummary->cogs
+                + (float) $accessorySummary->cogs,
+
+            'gross_profit' =>
+                (float) $lpgSummary->gross_profit
+                + (float) $accessorySummary->gross_profit,
+        ];
+
+        $summary['gross_margin'] = $summary['revenue'] > 0
+            ? ($summary['gross_profit'] / $summary['revenue']) * 100
+            : 0;
+
+        /*
+         * Recent posted sales for the on-screen report.
+         * The detailed export will be implemented separately.
+         */
+        $lpgSales = (clone $lpgQuery)
+            ->with(['branch', 'attendant'])
+            ->orderByDesc('sale_date')
+            ->orderByDesc('id')
+            ->limit(25)
+            ->get();
+
+        $accessorySales = (clone $accessoryQuery)
+            ->with(['branch', 'attendant', 'accessory'])
+            ->orderByDesc('sale_date')
+            ->orderByDesc('id')
+            ->limit(25)
+            ->get();
+
+        $sales = collect()
+            ->concat($lpgSales->map(function ($sale) {
+                return [
+                    'type' => 'LPG',
+                    'sale_number' => $sale->sale_number,
+                    'sale_date' => $sale->sale_date,
+                    'branch' => $sale->branch?->branch_name,
+                    'attendant' => $sale->attendant?->name,
+                    'quantity' => $sale->quantity_kg,
+                    'unit' => 'kg',
+                    'revenue' => $sale->total_amount,
+                    'cogs' => $sale->cost_of_goods_sold,
+                    'gross_profit' => $sale->gross_profit,
+                ];
+            }))
+            ->concat($accessorySales->map(function ($sale) {
+                return [
+                    'type' => 'Accessory',
+                    'sale_number' => $sale->sale_number,
+                    'sale_date' => $sale->sale_date,
+                    'branch' => $sale->branch?->branch_name,
+                    'attendant' => $sale->attendant?->name,
+                    'quantity' => $sale->quantity,
+                    'unit' => 'units',
+                    'revenue' => $sale->total_amount,
+                    'cogs' => $sale->cost_of_goods_sold,
+                    'gross_profit' => $sale->gross_profit,
+                ];
+            }))
+            ->sortByDesc('sale_date')
+            ->take(25)
+            ->values();
+
+        $branches = Branch::query()
+            ->when(
+                $allowedBranchIds !== null,
+                fn ($query) => $query->whereIn('id', $allowedBranchIds)
+            )
+            ->orderBy('branch_name')
+            ->get();
+
+        return view('admin.reports.sales.index', [
+            'filters' => $filters,
+            'branches' => $branches,
+            'lpgSummary' => $lpgSummary,
+            'accessorySummary' => $accessorySummary,
+            'summary' => $summary,
+            'sales' => $sales,
+        ]);
+    }
+
+
+    /**
+     * Export filtered posted LPG and accessory sales to CSV.
+     */
+    public function exportCsv(Request $request)
+    {
+        $user = $request->user();
+
+        abort_unless(
+            $user && $user->hasPermission('reports.view'),
+            403
+        );
+
+        $filters = $request->validate([
+            'date_from' => ['nullable', 'date_format:Y-m-d'],
+            'date_to' => [
+                'nullable',
+                'date_format:Y-m-d',
+                'after_or_equal:date_from',
+            ],
+            'branch_id' => [
+                'nullable',
+                'integer',
+                'exists:branches,id',
+            ],
+        ]);
+
+        $branchId = $filters['branch_id'] ?? null;
+        $dateFrom = $filters['date_from'] ?? null;
+        $dateTo = $filters['date_to'] ?? null;
+
+        $allowedBranchIds = null;
+
+        if (!$user->hasRole('owner')) {
+            $allowedBranchIds = $user->branches()
+                ->pluck('branches.id')
+                ->all();
+
+            if ($branchId !== null) {
+                abort_unless(
+                    in_array(
+                        (int) $branchId,
+                        array_map('intval', $allowedBranchIds),
+                        true
+                    ),
+                    403
+                );
+            }
+        }
+
+        $lpgQuery = LpgSale::query()
+            ->where('status', LpgSale::STATUS_POSTED);
+
+        $accessoryQuery = AccessorySale::query()
+            ->where('status', AccessorySale::STATUS_POSTED);
+
+        foreach ([$lpgQuery, $accessoryQuery] as $query) {
+            if ($allowedBranchIds !== null) {
+                $query->whereIn('branch_id', $allowedBranchIds);
+            }
+
+            if ($branchId !== null) {
+                $query->where('branch_id', $branchId);
+            }
+
+            if ($dateFrom !== null) {
+                $query->whereDate('sale_date', '>=', $dateFrom);
+            }
+
+            if ($dateTo !== null) {
+                $query->whereDate('sale_date', '<=', $dateTo);
+            }
+        }
+
+        $filename = 'intisar-sales-report-'
+            . now()->format('Ymd-His')
+            . '.csv';
+
+        return response()->streamDownload(
+            function () use ($lpgQuery, $accessoryQuery) {
+                $handle = fopen('php://output', 'w');
+
+                // UTF-8 BOM for spreadsheet compatibility.
+                fwrite($handle, "\xEF\xBB\xBF");
+
+                fputcsv($handle, [
+                    'Date',
+                    'Item Name',
+                    'Category',
+                    'Branch',
+                    'Sales Agent',
+                    'Quantity',
+                    'Unit',
+                    'Revenue (NGN)',
+                    'COGS (NGN)',
+                    'Gross Profit (NGN)',
+                    'Payment Method',
+                    'Payment Reference',
+                ]);
+
+                /*
+                 * Prefix spreadsheet-sensitive text to prevent
+                 * formulas from being executed when CSV is opened.
+                 */
+                $safeText = static function ($value): string {
+                    $text = (string) ($value ?? '');
+
+                    if (preg_match('/^[\s]*[=+\-@]/u', $text)) {
+                        return "'" . $text;
+                    }
+
+                    return $text;
+                };
+
+                foreach (
+                    $lpgQuery
+                        ->with(['branch', 'attendant'])
+                        ->orderBy('id')
+                        ->cursor() as $sale
+                ) {
+                    fputcsv($handle, [
+                        $sale->sale_date?->format('Y-m-d'),
+                        'LPG',
+                        'LPG',
+                        $safeText($sale->branch?->branch_name),
+                        $safeText($sale->attendant?->name),
+                        $sale->quantity_kg,
+                        'kg',
+                        $sale->total_amount,
+                        $sale->cost_of_goods_sold,
+                        $sale->gross_profit,
+                        $safeText($sale->payment_method),
+                        $safeText($sale->payment_reference),
+                    ]);
+                }
+
+                foreach (
+                    $accessoryQuery
+                        ->with(['branch', 'attendant', 'accessory'])
+                        ->orderBy('id')
+                        ->cursor() as $sale
+                ) {
+                    fputcsv($handle, [
+                        $sale->sale_date?->format('Y-m-d'),
+                        $safeText($sale->accessory?->name ?? 'Unknown Accessory'),
+                        'Accessory',
+                        $safeText($sale->branch?->branch_name),
+                        $safeText($sale->attendant?->name),
+                        $sale->quantity,
+                        'units',
+                        $sale->total_amount,
+                        $sale->cost_of_goods_sold,
+                        $sale->gross_profit,
+                        '',
+                        '',
+                    ]);
+                }
+
+                fclose($handle);
+            },
+            $filename,
+            [
+                'Content-Type' => 'text/csv; charset=UTF-8',
+            ]
+        );
+    }
+
+
+    /**
+     * Export filtered posted sales as a PDF report.
+     */
+    public function exportPdf(Request $request)
+    {
+        $user = $request->user();
+
+        abort_unless(
+            $user && $user->hasPermission('reports.view'),
+            403
+        );
+
+        $filters = $request->validate([
+            'date_from' => ['nullable', 'date_format:Y-m-d'],
+            'date_to' => [
+                'nullable',
+                'date_format:Y-m-d',
+                'after_or_equal:date_from',
+            ],
+            'branch_id' => [
+                'nullable',
+                'integer',
+                'exists:branches,id',
+            ],
+        ]);
+
+        $branchId = $filters['branch_id'] ?? null;
+        $dateFrom = $filters['date_from'] ?? null;
+        $dateTo = $filters['date_to'] ?? null;
+
+        $allowedBranchIds = null;
+
+        if (!$user->hasRole('owner')) {
+            $allowedBranchIds = $user->branches()
+                ->pluck('branches.id')
+                ->all();
+
+            if ($branchId !== null) {
+                abort_unless(
+                    in_array(
+                        (int) $branchId,
+                        array_map('intval', $allowedBranchIds),
+                        true
+                    ),
+                    403
+                );
+            }
+        }
+
+        $lpgQuery = LpgSale::query()
+            ->where('status', LpgSale::STATUS_POSTED);
+
+        $accessoryQuery = AccessorySale::query()
+            ->where('status', AccessorySale::STATUS_POSTED);
+
+        foreach ([$lpgQuery, $accessoryQuery] as $query) {
+            if ($allowedBranchIds !== null) {
+                $query->whereIn('branch_id', $allowedBranchIds);
+            }
+
+            if ($branchId !== null) {
+                $query->where('branch_id', $branchId);
+            }
+
+            if ($dateFrom !== null) {
+                $query->whereDate('sale_date', '>=', $dateFrom);
+            }
+
+            if ($dateTo !== null) {
+                $query->whereDate('sale_date', '<=', $dateTo);
+            }
+        }
+
+        /*
+         * Financial summaries are calculated directly from
+         * the recorded posted transactions.
+         */
+        $lpgSummary = (clone $lpgQuery)
+            ->selectRaw('COUNT(*) as transactions')
+            ->selectRaw('COALESCE(SUM(total_amount), 0) as revenue')
+            ->selectRaw('COALESCE(SUM(cost_of_goods_sold), 0) as cogs')
+            ->selectRaw('COALESCE(SUM(gross_profit), 0) as gross_profit')
+            ->first();
+
+        $accessorySummary = (clone $accessoryQuery)
+            ->selectRaw('COUNT(*) as transactions')
+            ->selectRaw('COALESCE(SUM(total_amount), 0) as revenue')
+            ->selectRaw('COALESCE(SUM(cost_of_goods_sold), 0) as cogs')
+            ->selectRaw('COALESCE(SUM(gross_profit), 0) as gross_profit')
+            ->first();
+
+        $summary = [
+            'transactions' =>
+                (int) $lpgSummary->transactions
+                + (int) $accessorySummary->transactions,
+
+            'revenue' =>
+                (float) $lpgSummary->revenue
+                + (float) $accessorySummary->revenue,
+
+            'cogs' =>
+                (float) $lpgSummary->cogs
+                + (float) $accessorySummary->cogs,
+
+            'gross_profit' =>
+                (float) $lpgSummary->gross_profit
+                + (float) $accessorySummary->gross_profit,
+        ];
+
+        /*
+         * Detailed sales: no 25-transaction dashboard limit.
+         */
+        $lpgSales = (clone $lpgQuery)
+            ->with(['branch', 'attendant'])
+            ->orderBy('sale_date')
+            ->orderBy('id')
+            ->get();
+
+        $accessorySales = (clone $accessoryQuery)
+            ->with(['branch', 'attendant', 'accessory'])
+            ->orderBy('sale_date')
+            ->orderBy('id')
+            ->get();
+
+        $sales = collect()
+            ->concat($lpgSales->map(function ($sale) {
+                return [
+                    'date' => $sale->sale_date?->format('Y-m-d'),
+                    'item_name' => 'LPG',
+                    'category' => 'LPG',
+                    'branch' => $sale->branch?->branch_name,
+                    'attendant' => $sale->attendant?->name,
+                    'quantity' => $sale->quantity_kg . ' kg',
+                    'revenue' => $sale->total_amount,
+                    'cogs' => $sale->cost_of_goods_sold,
+                    'gross_profit' => $sale->gross_profit,
+                ];
+            }))
+            ->concat($accessorySales->map(function ($sale) {
+                return [
+                    'date' => $sale->sale_date?->format('Y-m-d'),
+                    'item_name' => $sale->accessory?->name
+                        ?? 'Unknown Accessory',
+                    'category' => 'Accessory',
+                    'branch' => $sale->branch?->branch_name,
+                    'attendant' => $sale->attendant?->name,
+                    'quantity' => $sale->quantity . ' units',
+                    'revenue' => $sale->total_amount,
+                    'cogs' => $sale->cost_of_goods_sold,
+                    'gross_profit' => $sale->gross_profit,
+                ];
+            }))
+            ->sortBy('date')
+            ->values();
+
+        $branchName = $branchId !== null
+            ? Branch::query()
+                ->whereKey($branchId)
+                ->value('branch_name')
+            : null;
+
+        $pdf = Pdf::loadView(
+            'admin.reports.sales.pdf',
+            [
+                'filters' => $filters,
+                'branchName' => $branchName,
+                'lpgSummary' => $lpgSummary,
+                'accessorySummary' => $accessorySummary,
+                'summary' => $summary,
+                'sales' => $sales,
+            ]
+        )->setPaper('a4', 'landscape');
+
+        return $pdf->download(
+            'intisar-sales-report-' . now()->format('Ymd-His') . '.pdf'
+        );
+    }
+
+
+}

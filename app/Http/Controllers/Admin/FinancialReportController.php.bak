@@ -1,0 +1,410 @@
+<?php
+
+namespace App\Http\Controllers\Admin;
+
+use App\Http\Controllers\Controller;
+use App\Models\AccessorySale;
+use App\Models\Branch;
+use App\Models\LpgSale;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\View\View;
+
+class FinancialReportController extends Controller
+{
+    public function index(Request $request): View
+    {
+        $user = $request->user();
+
+        abort_unless(
+            $user && $user->hasPermission('reports.view'),
+            403
+        );
+
+        $filters = $request->validate([
+            'date_from' => ['nullable', 'date'],
+            'date_to' => ['nullable', 'date', 'after_or_equal:date_from'],
+            'branch_id' => ['nullable', 'integer', 'exists:branches,id'],
+        ]);
+
+        $dateFrom = $filters['date_from'] ?? now()->startOfMonth()->toDateString();
+        $dateTo = $filters['date_to'] ?? now()->toDateString();
+        $branchId = $filters['branch_id'] ?? null;
+
+        $isOwner = $user->role?->name === 'owner';
+
+        $allowedBranchIds = $isOwner
+            ? null
+            : $user->branches()->pluck('branches.id')->all();
+
+        if (!$isOwner && $branchId !== null) {
+            abort_unless(
+                in_array((int) $branchId, array_map('intval', $allowedBranchIds), true),
+                403
+            );
+        }
+
+        $branches = Branch::query()
+            ->when(
+                !$isOwner,
+                fn ($query) => $query->whereIn('id', $allowedBranchIds)
+            )
+            ->orderBy('branch_name')
+            ->get();
+
+        $summarize = function (string $model) use (
+            $dateFrom,
+            $dateTo,
+            $branchId,
+            $isOwner,
+            $allowedBranchIds
+        ): array {
+            $row = $model::query()
+                ->where('status', 'posted')
+                ->whereDate('sale_date', '>=', $dateFrom)
+                ->whereDate('sale_date', '<=', $dateTo)
+                ->when(
+                    $branchId !== null,
+                    fn ($query) => $query->where('branch_id', $branchId)
+                )
+                ->when(
+                    !$isOwner,
+                    fn ($query) => $query->whereIn('branch_id', $allowedBranchIds)
+                )
+                ->selectRaw('COUNT(*) as transactions')
+                ->selectRaw('COALESCE(SUM(total_amount), 0) as revenue')
+                ->selectRaw('COALESCE(SUM(cost_of_goods_sold), 0) as cogs')
+                ->first();
+
+            $revenue = (float) $row->revenue;
+            $cogs = (float) $row->cogs;
+
+            return [
+                'transactions' => (int) $row->transactions,
+                'revenue' => $revenue,
+                'cogs' => $cogs,
+                'gross_profit' => $revenue - $cogs,
+            ];
+        };
+
+        $lpg = $summarize(LpgSale::class);
+        $accessories = $summarize(AccessorySale::class);
+
+        $totalRevenue = $lpg['revenue'] + $accessories['revenue'];
+        $totalCogs = $lpg['cogs'] + $accessories['cogs'];
+        $grossProfit = $totalRevenue - $totalCogs;
+
+        $summary = [
+            'transactions' => $lpg['transactions'] + $accessories['transactions'],
+            'revenue' => $totalRevenue,
+            'cogs' => $totalCogs,
+            'gross_profit' => $grossProfit,
+            'gross_margin' => $totalRevenue > 0
+                ? ($grossProfit / $totalRevenue) * 100
+                : 0,
+        ];
+
+        return view('admin.reports.financial.index', [
+            'branches' => $branches,
+            'filters' => [
+                'date_from' => $dateFrom,
+                'date_to' => $dateTo,
+                'branch_id' => $branchId,
+            ],
+            'lpg' => $lpg,
+            'accessories' => $accessories,
+            'summary' => $summary,
+        ]);
+    }
+
+
+    public function exportCsv(Request $request)
+    {
+        $user = $request->user();
+
+        abort_unless(
+            $user && $user->hasPermission('reports.view'),
+            403
+        );
+
+        $filters = $request->validate([
+            'date_from' => ['nullable', 'date'],
+            'date_to' => ['nullable', 'date', 'after_or_equal:date_from'],
+            'branch_id' => ['nullable', 'integer', 'exists:branches,id'],
+        ]);
+
+        $dateFrom = $filters['date_from']
+            ?? now()->startOfMonth()->toDateString();
+
+        $dateTo = $filters['date_to']
+            ?? now()->toDateString();
+
+        $branchId = $filters['branch_id'] ?? null;
+
+        $isOwner = $user->role?->name === 'owner';
+
+        $allowedBranchIds = $isOwner
+            ? null
+            : $user->branches()->pluck('branches.id')->all();
+
+        if (!$isOwner && $branchId !== null) {
+            abort_unless(
+                in_array(
+                    (int) $branchId,
+                    array_map('intval', $allowedBranchIds),
+                    true
+                ),
+                403
+            );
+        }
+
+        $summarize = function (string $model) use (
+            $dateFrom,
+            $dateTo,
+            $branchId,
+            $isOwner,
+            $allowedBranchIds
+        ): array {
+            $row = $model::query()
+                ->where('status', 'posted')
+                ->whereDate('sale_date', '>=', $dateFrom)
+                ->whereDate('sale_date', '<=', $dateTo)
+                ->when(
+                    $branchId !== null,
+                    fn ($query) => $query->where('branch_id', $branchId)
+                )
+                ->when(
+                    !$isOwner,
+                    fn ($query) => $query->whereIn(
+                        'branch_id',
+                        $allowedBranchIds
+                    )
+                )
+                ->selectRaw('COUNT(*) as transactions')
+                ->selectRaw('COALESCE(SUM(total_amount), 0) as revenue')
+                ->selectRaw('COALESCE(SUM(cost_of_goods_sold), 0) as cogs')
+                ->first();
+
+            $revenue = (float) $row->revenue;
+            $cogs = (float) $row->cogs;
+            $profit = $revenue - $cogs;
+
+            return [
+                'transactions' => (int) $row->transactions,
+                'revenue' => $revenue,
+                'cogs' => $cogs,
+                'gross_profit' => $profit,
+                'margin' => $revenue > 0
+                    ? ($profit / $revenue) * 100
+                    : 0,
+            ];
+        };
+
+        $lpg = $summarize(LpgSale::class);
+        $accessories = $summarize(AccessorySale::class);
+
+        $totalRevenue = $lpg['revenue'] + $accessories['revenue'];
+        $totalCogs = $lpg['cogs'] + $accessories['cogs'];
+        $totalProfit = $totalRevenue - $totalCogs;
+
+        $total = [
+            'transactions' => $lpg['transactions']
+                + $accessories['transactions'],
+            'revenue' => $totalRevenue,
+            'cogs' => $totalCogs,
+            'gross_profit' => $totalProfit,
+            'margin' => $totalRevenue > 0
+                ? ($totalProfit / $totalRevenue) * 100
+                : 0,
+        ];
+
+        $filename = 'financial-report-'
+            . $dateFrom . '-to-' . $dateTo . '.csv';
+
+        return response()->streamDownload(function () use (
+            $dateFrom,
+            $dateTo,
+            $branchId,
+            $lpg,
+            $accessories,
+            $total
+        ) {
+            $handle = fopen('php://output', 'w');
+
+            // UTF-8 BOM for Excel compatibility.
+            fwrite($handle, "\xEF\xBB\xBF");
+
+            fputcsv($handle, ['INTISAR OIL & GAS']);
+            fputcsv($handle, ['FINANCIAL PERFORMANCE REPORT']);
+            fputcsv($handle, ['From Date', $dateFrom]);
+            fputcsv($handle, ['To Date', $dateTo]);
+            fputcsv($handle, [
+                'Branch',
+                $branchId
+                    ? (Branch::find($branchId)?->branch_name ?? 'Selected Branch')
+                    : 'All Authorized Branches',
+            ]);
+
+            fputcsv($handle, []);
+
+            fputcsv($handle, [
+                'Category',
+                'Transactions',
+                'Revenue (NGN)',
+                'COGS (NGN)',
+                'Gross Profit (NGN)',
+                'Gross Margin (%)',
+            ]);
+
+            foreach ([
+                'LPG Sales' => $lpg,
+                'Accessory Sales' => $accessories,
+                'TOTAL' => $total,
+            ] as $category => $data) {
+                fputcsv($handle, [
+                    $category,
+                    $data['transactions'],
+                    number_format($data['revenue'], 2, '.', ''),
+                    number_format($data['cogs'], 2, '.', ''),
+                    number_format($data['gross_profit'], 2, '.', ''),
+                    number_format($data['margin'], 2, '.', ''),
+                ]);
+            }
+
+            fputcsv($handle, []);
+            fputcsv($handle, [
+                'Note',
+                'Gross profit excludes operating expenses. '
+                . 'This report does not represent net profit or cash balance.',
+            ]);
+
+            fclose($handle);
+        }, $filename, [
+            'Content-Type' => 'text/csv; charset=UTF-8',
+        ]);
+    }
+
+
+    public function exportPdf(Request $request)
+    {
+        $user = $request->user();
+
+        abort_unless(
+            $user && $user->hasPermission('reports.view'),
+            403
+        );
+
+        $filters = $request->validate([
+            'date_from' => ['nullable', 'date'],
+            'date_to' => ['nullable', 'date', 'after_or_equal:date_from'],
+            'branch_id' => ['nullable', 'integer', 'exists:branches,id'],
+        ]);
+
+        $dateFrom = $filters['date_from']
+            ?? now()->startOfMonth()->toDateString();
+
+        $dateTo = $filters['date_to']
+            ?? now()->toDateString();
+
+        $branchId = $filters['branch_id'] ?? null;
+
+        $isOwner = $user->role?->name === 'owner';
+
+        $allowedBranchIds = $isOwner
+            ? null
+            : $user->branches()->pluck('branches.id')->all();
+
+        if (!$isOwner && $branchId !== null) {
+            abort_unless(
+                in_array(
+                    (int) $branchId,
+                    array_map('intval', $allowedBranchIds),
+                    true
+                ),
+                403
+            );
+        }
+
+        $summarize = function (string $model) use (
+            $dateFrom,
+            $dateTo,
+            $branchId,
+            $isOwner,
+            $allowedBranchIds
+        ): array {
+            $row = $model::query()
+                ->where('status', 'posted')
+                ->whereDate('sale_date', '>=', $dateFrom)
+                ->whereDate('sale_date', '<=', $dateTo)
+                ->when(
+                    $branchId !== null,
+                    fn ($query) => $query->where('branch_id', $branchId)
+                )
+                ->when(
+                    !$isOwner,
+                    fn ($query) => $query->whereIn(
+                        'branch_id',
+                        $allowedBranchIds
+                    )
+                )
+                ->selectRaw('COUNT(*) as transactions')
+                ->selectRaw('COALESCE(SUM(total_amount), 0) as revenue')
+                ->selectRaw('COALESCE(SUM(cost_of_goods_sold), 0) as cogs')
+                ->first();
+
+            $revenue = (float) $row->revenue;
+            $cogs = (float) $row->cogs;
+            $profit = $revenue - $cogs;
+
+            return [
+                'transactions' => (int) $row->transactions,
+                'revenue' => $revenue,
+                'cogs' => $cogs,
+                'gross_profit' => $profit,
+                'margin' => $revenue > 0
+                    ? ($profit / $revenue) * 100
+                    : 0,
+            ];
+        };
+
+        $lpg = $summarize(LpgSale::class);
+        $accessories = $summarize(AccessorySale::class);
+
+        $totalRevenue = $lpg['revenue'] + $accessories['revenue'];
+        $totalCogs = $lpg['cogs'] + $accessories['cogs'];
+        $totalProfit = $totalRevenue - $totalCogs;
+
+        $summary = [
+            'transactions' => $lpg['transactions']
+                + $accessories['transactions'],
+            'revenue' => $totalRevenue,
+            'cogs' => $totalCogs,
+            'gross_profit' => $totalProfit,
+            'gross_margin' => $totalRevenue > 0
+                ? ($totalProfit / $totalRevenue) * 100
+                : 0,
+        ];
+
+        $branchName = $branchId
+            ? Branch::findOrFail($branchId)->branch_name
+            : 'All Authorized Branches';
+
+        $pdf = \Barryvdh\DomPDF\Facade\Pdf::loadView(
+            'admin.reports.financial.pdf',
+            [
+                'dateFrom' => $dateFrom,
+                'dateTo' => $dateTo,
+                'branchName' => $branchName,
+                'lpg' => $lpg,
+                'accessories' => $accessories,
+                'summary' => $summary,
+            ]
+        )->setPaper('a4', 'landscape');
+
+        return $pdf->download(
+            'financial-report-' . $dateFrom . '-to-' . $dateTo . '.pdf'
+        );
+    }
+
+
+}
