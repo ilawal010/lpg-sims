@@ -17,74 +17,38 @@
         </p>
     </div>
 
-    <form method="POST"
-          action="{{ route('password.first-change.update') }}">
+    <form method="POST" action="{{ route('password.first-change.update') }}">
 
         @csrf
         @method('PUT')
 
         <div>
-            <x-input-label
-                for="current_password"
-                value="Current Password"
-            />
+            <x-input-label for="current_password" value="Current Password" />
 
-            <x-text-input
-                id="current_password"
-                name="current_password"
-                type="password"
-                class="mt-1 block w-full"
-                required
-                autocomplete="current-password"
-            />
+            <x-text-input id="current_password" name="current_password" type="password" class="mt-1 block w-full"
+                required autocomplete="current-password" />
 
-            <x-input-error
-                :messages="$errors->get('current_password')"
-                class="mt-2"
-            />
+            <x-input-error :messages="$errors->get('current_password')" class="mt-2" />
         </div>
 
         <div class="mt-4">
-            <x-input-label
-                for="password"
-                value="New Password"
-            />
+            <x-input-label for="password" value="New Password" />
 
-            <x-text-input
-                id="password"
-                name="password"
-                type="password"
-                class="mt-1 block w-full"
-                required
-                minlength="12"
-                autocomplete="new-password"
-            />
+            <x-text-input id="password" name="password" type="password" class="mt-1 block w-full" required
+                minlength="6" autocomplete="new-password" />
 
-            <x-input-error
-                :messages="$errors->get('password')"
-                class="mt-2"
-            />
+            <x-input-error :messages="$errors->get('password')" class="mt-2" />
 
             <p class="mt-2 text-xs text-gray-500">
-                Minimum 12 characters.
+                Minimum 6 characters.
             </p>
         </div>
 
         <div class="mt-4">
-            <x-input-label
-                for="password_confirmation"
-                value="Confirm New Password"
-            />
+            <x-input-label for="password_confirmation" value="Confirm New Password" />
 
-            <x-text-input
-                id="password_confirmation"
-                name="password_confirmation"
-                type="password"
-                class="mt-1 block w-full"
-                required
-                minlength="12"
-                autocomplete="new-password"
-            />
+            <x-text-input id="password_confirmation" name="password_confirmation" type="password"
+                class="mt-1 block w-full" required minlength="6" autocomplete="new-password" />
         </div>
 
         <div class="mt-6">
@@ -95,14 +59,11 @@
 
     </form>
 
-    <form method="POST"
-          action="{{ route('logout') }}"
-          class="mt-4 text-center">
+    <form method="POST" action="{{ route('logout') }}" class="mt-4 text-center">
 
         @csrf
 
-        <button type="submit"
-                class="text-sm text-gray-500 hover:text-gray-700">
+        <button type="submit" class="text-sm text-gray-500 hover:text-gray-700">
             Logout
         </button>
     </form>
